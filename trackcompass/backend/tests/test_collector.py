@@ -171,6 +171,57 @@ class TestRSS:
         with pytest.raises(ValueError, match="RSS 解析失败"):
             adapter.fetch(CollectContext(limit=5))
 
+    # ── 非法控制字符 ───────────────────────────────────────────────────
+    # 36氪 正文实测出现过 \x1e（RS 记录分隔符，原文用它分隔「器件／整机／集群」）。
+    # XML 1.0 的合法字符只有 #x9 #xA #xD [#x20-#xD7FF] [#xE000-#xFFFD]，
+    # \x1e 不在其中，ET.fromstring 会整篇报 not well-formed —— 一个字符毁掉整轮采集。
+    RSS_CTRL = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rss version="2.0"><channel><title>36氪</title><item>'
+        "<title>量子计算融资</title>"
+        "<link><![CDATA[https://36kr.com/p/9]]></link>"
+        "<description><![CDATA[<p>器件\x1e整机\x1e集群全链条自研</p>]]></description>"
+        "</item></channel></rss>"
+    )
+
+    def test_parses_rss_with_illegal_control_char(self):
+        adapter = TechNews36KrAdapter(_FakeClient({"36kr.com/feed": self.RSS_CTRL}))
+        rows = adapter.fetch(CollectContext(limit=5))
+        assert len(rows) == 1, "含 \\x1e 的 feed 必须能解析出来"
+        assert "器件" in rows[0].content and "整机" in rows[0].content
+
+    def test_control_char_replaced_by_space_not_deleted(self):
+        """替换成空格而不是直接删：否则「器件」「整机」会粘成「器件整机」。"""
+        adapter = TechNews36KrAdapter(_FakeClient({"36kr.com/feed": self.RSS_CTRL}))
+        rows = adapter.fetch(CollectContext(limit=5))
+        assert "器件 整机" in rows[0].content
+
+    # ── 裸 & ──────────────────────────────────────────────────────────
+    RSS_AMP = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rss version="2.0"><channel><title>36氪</title><item>'
+        "<title>汽车 &amp; 出行</title>"
+        "<link><![CDATA[https://36kr.com/p/8]]></link>"
+        "<description><![CDATA[<p>A&B 达成合作</p>]]></description>"
+        "</item></channel></rss>"
+    )
+
+    def test_escapes_bare_ampersand(self):
+        adapter = TechNews36KrAdapter(_FakeClient({"36kr.com/feed": self.RSS_AMP}))
+        rows = adapter.fetch(CollectContext(limit=5))
+        assert len(rows) == 1, "裸 & 应被转义后正常解析"
+        assert "A&B" in rows[0].content, "解析后正文里的 & 应还原"
+
+    def test_escaped_entities_not_double_escaped(self):
+        """`&amp;` / `&#39;` 不能再转义一次，否则正文会冒出 `&amp;amp;`。"""
+        from app.collector.sources.tech_news import _escape_bare_amp, _sanitize_xml
+
+        assert _escape_bare_amp("A&amp;B &#39;x&#x27;") == "A&amp;B &#39;x&#x27;"
+        assert _escape_bare_amp("A&B") == "A&amp;B"
+        assert _sanitize_xml("合法\x1e文本") == ("合法 文本", 1)
+        assert _sanitize_xml("正常文本") == ("正常文本", 0)
+        assert _sanitize_xml("") == ("", 0)
+
 
 # ---------------------------------------------------------------- 招标源
 class TestBidding:

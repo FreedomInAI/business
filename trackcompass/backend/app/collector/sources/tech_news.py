@@ -58,11 +58,36 @@ class RSSAdapter(SourceAdapter):
 
     # -------------------------------------------------------------- 解析
     def _parse(self, text: str) -> list[dict]:
-        """解析 RSS 2.0 / Atom，返回统一的条目字典列表。"""
+        """解析 RSS 2.0 / Atom，返回统一的条目字典列表。
+
+        解析前先做两轮**确定性**清洗，因为中文站的正文里常出现 XML 1.0
+        不允许的东西，一次清洗不够：
+
+        ① 非法控制字符 —— 36氪 正文实测出现过 `\\x1e`（RS 记录分隔符，
+           原文用它分隔「器件／整机／集群」这类并列词）。XML 1.0 的合法字符
+           只有 `#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]`，
+           `\\x1e` 不在其中，`ET.fromstring` 直接报
+           `not well-formed (invalid token): line 120, column 120`。
+           这里把它替换成空格而不是删掉，避免两个词粘成一坨。
+
+        ② 裸 `&` —— 正文写 `A&B` 没转义成 `&amp;` 也很常见。只替换**后面
+           不跟实体名／实体编号**的 `&`，所以 `&amp;` `&#39;` 不会被二次转义。
+
+        两轮都是「规范化」而不是「猜内容」，不改文章语义；两轮都救不回来的
+        仍然如实抛错，不静默降级。
+        """
+        cleaned, stripped = _sanitize_xml(text)
         try:
-            root = ET.fromstring(text.strip())
-        except ET.ParseError as exc:
-            raise ValueError(f"RSS 解析失败：{exc}") from exc
+            root = ET.fromstring(cleaned.strip())
+        except ET.ParseError as first_exc:
+            try:
+                root = ET.fromstring(_escape_bare_amp(cleaned).strip())
+            except ET.ParseError:
+                raise ValueError(
+                    f"RSS 解析失败：{first_exc}"
+                    f"（原文 {len(text)} 字符，已剔除 {stripped} 个非法控制字符，"
+                    f"裸 & 转义后仍失败）"
+                ) from first_exc
 
         items: list[dict] = []
         # RSS 2.0
@@ -126,6 +151,28 @@ def _find(node: ET.Element, tag: str, ns: str | None = None) -> str | None:
 
 def _norm_time(value: str | None) -> str | None:
     return _MULTISPACE_RE.sub(" ", value).strip() if value else None
+
+
+#: XML 1.0 的合法字符集之外的字符。范围取自 XML 1.0 §2.2 Char 产生式：
+#: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+_ILLEGAL_XML_RE = re.compile(
+    "[^\t\n\r\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]"
+)
+
+#: 裸 `&`：后面不是实体名也不是实体编号。`&amp;` / `&#39;` / `&#x27;` 都不匹配。
+_BARE_AMP_RE = re.compile(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_][A-Za-z0-9_.-]*;)")
+
+
+def _sanitize_xml(text: str) -> tuple[str, int]:
+    """替换 XML 非法控制字符为空格，返回 `(清洗后文本, 替换个数)`。"""
+    if not text:
+        return text, 0
+    return _ILLEGAL_XML_RE.subn(" ", text)
+
+
+def _escape_bare_amp(text: str) -> str:
+    """把裸 `&` 转成 `&amp;`；已转义的实体保持原样。"""
+    return _BARE_AMP_RE.sub("&amp;", text)
 
 
 __all__ = ["RSSAdapter", "TechNews36KrAdapter", "ITHomeAdapter", "JiemianAdapter"]
